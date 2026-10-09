@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 
 #include "cmu_packet.h"
 #include "grading.h"
@@ -41,6 +42,17 @@ typedef enum {
 } cmu_socket_type_t;
 
 /**
+ * Handshake states. The initiator goes INIT -> SENT_SYN -> ESTABLISHED; the
+ * listener goes INIT -> RECEIVED_SYN -> ESTABLISHED.
+ */
+typedef enum {
+  INIT = 0,               // No SYN sent (initiator) or received (listener).
+  SENT_SYN,               // Initiator: SYN sent, waiting for a valid SYN-ACK.
+  RECEIVED_SYN,           // Listener: SYN-ACK sent, waiting for a valid ACK.
+  HANDSHAKE_ESTABLISHED,  // Handshake complete from this side's view.
+} handshake_state_t;
+
+/**
  * This structure holds the state of a socket. You may modify this structure as
  * you see fit to include any additional state you need for your implementation.
  */
@@ -60,6 +72,10 @@ typedef struct {
   int dying;
   pthread_mutex_t death_lock;
   window_t window;
+  handshake_state_t handshake_state;
+  uint32_t isn;                   // Our initial sequence number. Written once.
+  struct timespec sent_syn_time;  // When the last SYN was sent (monotonic).
+  struct timespec sent_synack_time;  // When the last SYN-ACK was sent.
 } cmu_socket_t;
 
 /*

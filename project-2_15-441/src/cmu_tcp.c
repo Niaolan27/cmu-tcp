@@ -54,6 +54,11 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->window.last_ack_received = 0;
   sock->window.next_seq_expected = 0;
 
+  // The initiator picks its ISN in the backend's INIT state.
+  sock->handshake_state = INIT;
+  sock->isn = 0;
+  srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
+
   if (pthread_cond_init(&sock->wait_cond, NULL) != 0) {
     perror("ERROR condition variable not set\n");
     return EXIT_ERROR;
