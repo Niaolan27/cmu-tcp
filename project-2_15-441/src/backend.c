@@ -45,6 +45,25 @@ static long ms_since(const struct timespec *then) {
 }
 
 /**
+ * Picks a random initial sequence number from the kernel's entropy pool.
+ * rand() seeded with time and PID repeats across runs started close together
+ * (same second, or a fresh container reusing the same PID). Falls back to
+ * rand() if /dev/urandom can't be read.
+ */
+static uint32_t random_isn(void) {
+  uint32_t isn;
+  FILE *urandom = fopen("/dev/urandom", "rb");
+  if (urandom != NULL) {
+    size_t n = fread(&isn, sizeof(isn), 1, urandom);
+    fclose(urandom);
+    if (n == 1) {
+      return isn;
+    }
+  }
+  return (uint32_t)rand();
+}
+
+/**
  * Sends a header-only packet (no payload) to the socket's peer.
  *
  * @param sock The socket to send on.
@@ -196,7 +215,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   switch (flags) {
     case SYN_FLAG_MASK: {
       if (sock->handshake_state == INIT) {
-        sock->isn = (uint32_t)rand();
+        sock->isn = random_isn();
         sock->window.last_ack_received = sock->isn;
         sock->window.next_seq_expected = get_seq(hdr) + 1;
         send_empty_packet(sock, sock->window.last_ack_received,
@@ -279,8 +298,8 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags,
   ssize_t len = 0;
   uint32_t plen = 0, buf_size = 0, n = 0;
 
-  while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
-  }
+  // No lock while waiting: only the backend thread reads the socket, and
+  // holding recv_lock across poll() starves cmu_read on the app thread.
   switch (flags) {
     case NO_FLAG:
       len = recvfrom(sock->socket, &hdr, sizeof(cmu_tcp_header_t), MSG_PEEK,
@@ -313,10 +332,13 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags,
                    (struct sockaddr *)&(sock->conn), &conn_len);
       buf_size = buf_size + n;
     }
+    // handle_message appends to received_buf, which cmu_read shares.
+    while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+    }
     handle_message(sock, pkt);
+    pthread_mutex_unlock(&(sock->recv_lock));
     free(pkt);
   }
-  pthread_mutex_unlock(&(sock->recv_lock));
 }
 
 /**
@@ -372,7 +394,7 @@ void *begin_backend(void *in) {
     if (sock->type == TCP_INITIATOR) {
       switch (sock->handshake_state) {
         case INIT:
-          sock->isn = (uint32_t)rand();
+          sock->isn = random_isn();
           sock->window.last_ack_received = sock->isn;
           send_empty_packet(sock, sock->window.last_ack_received,
                             sock->window.next_seq_expected, SYN_FLAG_MASK);
