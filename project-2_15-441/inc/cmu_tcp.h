@@ -30,7 +30,8 @@
 
 typedef struct {
   uint32_t next_seq_expected;
-  uint32_t last_ack_received;
+  uint32_t last_ack_received;  // Base: oldest unacked seq we sent.
+  uint32_t next_seq_to_send;   // Seq of the next new byte; high-water mark.
 } window_t;
 
 /**
@@ -76,6 +77,11 @@ typedef struct {
   uint32_t isn;                   // Our initial sequence number. Written once.
   struct timespec sent_syn_time;  // When the last SYN was sent (monotonic).
   struct timespec sent_synack_time;  // When the last SYN-ACK was sent.
+  // Bytes from last_ack_received onward: in flight, then not yet sent. Backend
+  // thread only, so no lock.
+  uint8_t* outbound_buf;
+  int outbound_len;
+  struct timespec sent_data_time;  // Retransmit timer for the oldest segment.
 } cmu_socket_t;
 
 /*

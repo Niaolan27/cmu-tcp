@@ -69,6 +69,39 @@ static void send_empty_packet(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
 }
 
 /**
+ * Sends one data packet to the socket's peer.
+ *
+ * @param sock The socket to send on.
+ * @param seq Sequence number of the first payload byte.
+ * @param payload The bytes to send.
+ * @param payload_len Number of bytes to send; at most MSS.
+ */
+static void send_data_segment(cmu_socket_t *sock, uint32_t seq,
+                              uint8_t *payload, uint16_t payload_len) {
+  socklen_t conn_len = sizeof(sock->conn);
+  uint16_t src = sock->my_port;
+  uint16_t dst = ntohs(sock->conn.sin_port);
+  uint32_t ack = sock->window.next_seq_expected;
+  uint16_t hlen = sizeof(cmu_tcp_header_t);
+  uint16_t plen = hlen + payload_len;
+  uint8_t flags = ACK_FLAG_MASK;  // Every packet after the SYN carries an ACK.
+  uint16_t adv_window = 1;
+  uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, plen, flags,
+                               adv_window, 0, NULL, payload, payload_len);
+
+  sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
+         conn_len);
+  free(pkt);
+}
+
+/**
+ * Bytes sent but not yet acknowledged.
+ */
+static uint32_t bytes_in_flight(cmu_socket_t *sock) {
+  return sock->window.next_seq_to_send - sock->window.last_ack_received;
+}
+
+/**
  * A SYN-ACK is valid if it acknowledges our ISN.
  */
 static int check_valid_syn_ack(cmu_socket_t *sock, cmu_tcp_header_t *hdr) {
@@ -97,10 +130,61 @@ int has_been_acked(cmu_socket_t *sock, uint32_t seq) {
 }
 
 /**
+ * Slides the send window for an acknowledgement received after the handshake.
+ * Old or duplicate ACKs (ack <= base) and ACKs for bytes never sent
+ * (ack > next_seq_to_send) are ignored.
+ *
+ * @param sock The socket whose window to slide.
+ * @param ack The acknowledgement number received.
+ */
+static void handle_ack(cmu_socket_t *sock, uint32_t ack) {
+  if (!after(ack, sock->window.last_ack_received) ||
+      after(ack, sock->window.next_seq_to_send)) {
+    return;
+  }
+  uint32_t acked = ack - sock->window.last_ack_received;
+  sock->outbound_len -= acked;
+  memmove(sock->outbound_buf, sock->outbound_buf + acked, sock->outbound_len);
+  sock->window.last_ack_received = ack;
+  // Restart so the timer covers the new oldest segment.
+  if (bytes_in_flight(sock) > 0) {
+    clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
+  }
+}
+
+/**
+ * Accepts a data packet's payload if it is the next in-order segment, discards
+ * it otherwise, and answers either way with a cumulative acknowledgement.
+ *
+ * @param sock The socket receiving the data.
+ * @param pkt The data packet.
+ */
+static void handle_data(cmu_socket_t *sock, uint8_t *pkt) {
+  cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
+  uint32_t seq = get_seq(hdr);
+  uint16_t payload_len = get_payload_len(pkt);
+
+  if (seq == sock->window.next_seq_expected) {
+    sock->window.next_seq_expected = seq + payload_len;
+    uint8_t *payload = get_payload(pkt);
+
+    // Make sure there is enough space in the buffer to store the payload.
+    sock->received_buf =
+        realloc(sock->received_buf, sock->received_len + payload_len);
+    memcpy(sock->received_buf + sock->received_len, payload, payload_len);
+    sock->received_len += payload_len;
+  }
+
+  // Cumulative ACK: everything before next_seq_expected, whatever arrived.
+  send_empty_packet(sock, sock->window.last_ack_received,
+                    sock->window.next_seq_expected, ACK_FLAG_MASK);
+}
+
+/**
  * Updates the socket information to represent the newly received packet.
  *
- * In the current stop-and-wait implementation, this function also sends an
- * acknowledgement for the packet.
+ * ACKs slide the send window. Data packets (which carry the ACK flag) are
+ * answered with a cumulative acknowledgement; pure ACKs are never answered.
  *
  * @param sock The socket used for handling packets received.
  * @param pkt The packet data received by the socket.
@@ -128,6 +212,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
       if (sock->handshake_state == SENT_SYN && check_valid_syn_ack(sock, hdr)) {
         sock->window.next_seq_expected = get_seq(hdr) + 1;
         sock->window.last_ack_received = get_ack(hdr);
+        sock->window.next_seq_to_send = sock->window.last_ack_received;
         send_empty_packet(sock, sock->window.last_ack_received,
                           sock->window.next_seq_expected, ACK_FLAG_MASK);
         sock->handshake_state = HANDSHAKE_ESTABLISHED;
@@ -141,59 +226,35 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
       break;
     }
     case ACK_FLAG_MASK: {
-      // Validate against last_ack_received before the update below moves it.
-      if (sock->handshake_state == RECEIVED_SYN && check_valid_ack(sock, hdr)) {
-        sock->handshake_state = HANDSHAKE_ESTABLISHED;
-      }
       uint32_t ack = get_ack(hdr);
-      if (after(ack, sock->window.last_ack_received)) {
+      if (sock->handshake_state == RECEIVED_SYN) {
+        // The third-leg ACK, or a data packet carrying it if that ACK was
+        // lost. It covers our SYN-ACK's seq, which was never in outbound_buf,
+        // so it moves base without trimming.
+        if (!check_valid_ack(sock, hdr)) {
+          break;
+        }
         sock->window.last_ack_received = ack;
+        sock->window.next_seq_to_send = ack;
+        sock->handshake_state = HANDSHAKE_ESTABLISHED;
+      } else if (sock->handshake_state == HANDSHAKE_ESTABLISHED) {
+        handle_ack(sock, ack);
+      } else {
+        // Before the handshake, next_seq_to_send isn't set yet, so the
+        // window's range check would be meaningless.
+        break;
+      }
+      // Data packets carry the ACK flag; pure ACKs have no payload.
+      if (get_payload_len(pkt) > 0) {
+        handle_data(sock, pkt);
       }
       break;
     }
     default: {
-      // Ignore data until the handshake is established.
-      if (sock->handshake_state != HANDSHAKE_ESTABLISHED) {
-        break;
-      }
-      socklen_t conn_len = sizeof(sock->conn);
-      uint32_t seq = sock->window.last_ack_received;
-
-      // No payload.
-      uint8_t *payload = NULL;
-      uint16_t payload_len = 0;
-
-      // No extension.
-      uint16_t ext_len = 0;
-      uint8_t *ext_data = NULL;
-
-      uint16_t src = sock->my_port;
-      uint16_t dst = ntohs(sock->conn.sin_port);
-      uint32_t ack = get_seq(hdr) + get_payload_len(pkt);
-      uint16_t hlen = sizeof(cmu_tcp_header_t);
-      uint16_t plen = hlen + payload_len;
-      uint8_t flags = ACK_FLAG_MASK;
-      uint16_t adv_window = 1;
-      uint8_t *response_packet =
-          create_packet(src, dst, seq, ack, hlen, plen, flags, adv_window,
-                        ext_len, ext_data, payload, payload_len);
-
-      sendto(sock->socket, response_packet, plen, 0,
-             (struct sockaddr *)&(sock->conn), conn_len);
-      free(response_packet);
-
-      seq = get_seq(hdr);
-
-      if (seq == sock->window.next_seq_expected) {
-        sock->window.next_seq_expected = seq + get_payload_len(pkt);
-        payload_len = get_payload_len(pkt);
-        payload = get_payload(pkt);
-
-        // Make sure there is enough space in the buffer to store the payload.
-        sock->received_buf =
-            realloc(sock->received_buf, sock->received_len + payload_len);
-        memcpy(sock->received_buf + sock->received_len, payload, payload_len);
-        sock->received_len += payload_len;
+      // Data without the ACK flag. Ignore it until the handshake is
+      // established.
+      if (sock->handshake_state == HANDSHAKE_ESTABLISHED) {
+        handle_data(sock, pkt);
       }
     }
   }
@@ -259,60 +320,53 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags,
 }
 
 /**
- * Breaks up the data into packets and sends a single packet at a time.
- *
- * You should most certainly update this function in your implementation.
+ * Sends as much unsent data from `outbound_buf` as the window allows. Never
+ * blocks: ACKs slide the window in `handle_message`, and the backend loop calls
+ * this again on its next iteration to fill the space they free.
  *
  * @param sock The socket to use for sending data.
- * @param data The data to be sent.
- * @param buf_len The length of the data being sent.
  */
-void single_send(cmu_socket_t *sock, uint8_t *data, int buf_len) {
-  uint8_t *msg;
-  uint8_t *data_offset = data;
-  size_t conn_len = sizeof(sock->conn);
+void single_send(cmu_socket_t *sock) {
+  uint32_t window = CP1_WINDOW_SIZE;
+  uint32_t outbound_len = sock->outbound_len;
+  uint32_t in_flight = bytes_in_flight(sock);
 
-  int sockfd = sock->socket;
-  if (buf_len > 0) {
-    while (buf_len != 0) {
-      uint16_t payload_len = MIN((uint32_t)buf_len, (uint32_t)MSS);
-
-      uint16_t src = sock->my_port;
-      uint16_t dst = ntohs(sock->conn.sin_port);
-      uint32_t seq = sock->window.last_ack_received;
-      uint32_t ack = sock->window.next_seq_expected;
-      uint16_t hlen = sizeof(cmu_tcp_header_t);
-      uint16_t plen = hlen + payload_len;
-      uint8_t flags = 0;
-      uint16_t adv_window = 1;
-      uint16_t ext_len = 0;
-      uint8_t *ext_data = NULL;
-      uint8_t *payload = data_offset;
-
-      msg = create_packet(src, dst, seq, ack, hlen, plen, flags, adv_window,
-                          ext_len, ext_data, payload, payload_len);
-      buf_len -= payload_len;
-
-      while (1) {
-        // FIXME: This is using stop and wait, can we do better?
-        sendto(sockfd, msg, plen, 0, (struct sockaddr *)&(sock->conn),
-               conn_len);
-        check_for_data(sock, TIMEOUT, DEFAULT_TIMEOUT);
-        if (has_been_acked(sock, seq)) {
-          break;
-        }
-      }
-      free(msg);
-
-      data_offset += payload_len;
+  while (in_flight < window && in_flight < outbound_len) {
+    uint16_t payload_len =
+        MIN(MIN((uint32_t)MSS, outbound_len - in_flight), window - in_flight);
+    // Sending into an empty pipe: start the retransmit timer.
+    if (in_flight == 0) {
+      clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
     }
+    send_data_segment(sock, sock->window.next_seq_to_send,
+                      sock->outbound_buf + in_flight, payload_len);
+    sock->window.next_seq_to_send += payload_len;
+    in_flight += payload_len;
   }
+}
+
+/**
+ * Go-Back-N retransmission: resends every unacknowledged byte, oldest first,
+ * and restarts the retransmit timer. Leaves `next_seq_to_send` alone.
+ *
+ * @param sock The socket to use for sending data.
+ */
+static void resend_window(cmu_socket_t *sock) {
+  uint32_t in_flight = bytes_in_flight(sock);
+  uint32_t offset = 0;
+
+  while (offset < in_flight) {
+    uint16_t payload_len = MIN((uint32_t)MSS, in_flight - offset);
+    send_data_segment(sock, sock->window.last_ack_received + offset,
+                      sock->outbound_buf + offset, payload_len);
+    offset += payload_len;
+  }
+  clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
 }
 
 void *begin_backend(void *in) {
   cmu_socket_t *sock = (cmu_socket_t *)in;
   int death, buf_len, send_signal;
-  uint8_t *data;
 
   while (1) {
     if (sock->type == TCP_INITIATOR) {
@@ -359,23 +413,31 @@ void *begin_backend(void *in) {
 
     while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
     }
-    buf_len = sock->sending_len;
-
-    if (death && buf_len == 0) {
-      break;
-    }
-
-    if (buf_len > 0 && can_send) {
-      data = malloc(buf_len);
-      memcpy(data, sock->sending_buf, buf_len);
+    if (sock->sending_len > 0 && can_send) {
+      // Move new data into the window buffer, where it stays until acked.
+      sock->outbound_buf = realloc(sock->outbound_buf,
+                                   sock->outbound_len + sock->sending_len);
+      memcpy(sock->outbound_buf + sock->outbound_len, sock->sending_buf,
+             sock->sending_len);
+      sock->outbound_len += sock->sending_len;
       sock->sending_len = 0;
       free(sock->sending_buf);
       sock->sending_buf = NULL;
-      pthread_mutex_unlock(&(sock->send_lock));
-      single_send(sock, data, buf_len);
-      free(data);
-    } else {
-      pthread_mutex_unlock(&(sock->send_lock));
+    }
+    buf_len = sock->sending_len;
+    pthread_mutex_unlock(&(sock->send_lock));
+
+    // An empty sending_buf isn't enough: bytes may still be unacked.
+    if (death && buf_len == 0 && sock->outbound_len == 0) {
+      break;
+    }
+
+    if (can_send) {
+      if (bytes_in_flight(sock) > 0 &&
+          ms_since(&sock->sent_data_time) > DEFAULT_TIMEOUT) {
+        resend_window(sock);
+      }
+      single_send(sock);
     }
 
     check_for_data(sock, TIMEOUT, LOOP_TICK_MS);

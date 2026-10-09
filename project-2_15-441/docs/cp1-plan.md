@@ -180,97 +180,10 @@ int check_valid_ack(packet) {
 }
 ```
 
-### Concurrency note
-
-`handle_message` is only called from `check_for_data`, which is only called from
-`begin_backend` and `single_send` - all on the backend thread. So handshake
-state and timer fields need **no locking** between the loop body and the packet
-handler. A lock would only be required if something in `cmu_tcp.c` (app thread)
-had to read them.
-
----
-
-## TODO: sequence numbers
-
-**Not yet specified. This is the core of the handshake and blocks
-implementation.** The state machine above is scaffolding; synchronizing the two
-sequence spaces is the actual purpose.
-
-To resolve:
-
-- `cmu_socket` currently zeroes both directions (`cmu_tcp.c:51-55`), with a
-  `FIXME` saying ISNs should be random and `next_seq_expected` should come from
-  the peer's SYN. Decide the ISN scheme and where it is set.
-- For each of the three packets (SYN, SYN-ACK, ACK), in both directions: what
-  goes in `seq`, and what goes in `ack`?
-- On receipt of each, what socket state is written, and from which header field?
-- Does a SYN consume a byte of sequence space? Data point already available:
-  `test_cp1_basic_ack_packets.py:48-55` sends `seq_num=1000, flags=SYN_MASK` and
-  requires the reply's `ack_num == 1000 + 1`.
-- Which of these values must survive into data transfer, so that the first data
-  byte continues the sequence space the handshake established?
-
-## TODO: validity checks
-
-**Not yet specified.** "Valid SYN-ACK" (initiator, SENT_SYN) and "valid SYN"
-(listener, INIT) are load-bearing - an initiator that accepts *any* SYN-ACK
-behaves differently from one that checks it against the SYN it actually sent.
-
-To resolve:
-
-- Which header fields are checked, and against what stored state?
-- What happens to a packet that fails the check (ignored silently? any reply?).
-
-```
-```
-## TODO: duplicate and unexpected packets
-
-Normal loss path, not an edge case: if the listener's SYN-ACK drops, the
-initiator's SYN timer fires and resends a SYN, which arrives at a listener
-already in RECEIVED_SYN.
-
-To resolve:
-
-- **Duplicate SYN in RECEIVED_SYN**: ignore and wait for `sent_SYNACK_time`, or
-  respond immediately with a fresh SYN-ACK? Both converge; one is faster. If it
-  re-handles the SYN, does anything get re-initialized that must *not* be?
-  (Consider what was recorded when the first SYN was processed.)
-- **Data packet in RECEIVED_SYN**: the initiator sends its ACK and immediately
-  starts sending data, so if that ACK is lost, data arrives at an unestablished
-  listener. Current plan drops it and relies on the sender's retransmission.
-  State this explicitly.
-- **ACK carrying a payload**: the provided test sends `flags=ACK_MASK` *with* a
-  payload (`test_cp1_basic_ack_packets.py:85-95`) and expects the payload
-  acknowledged. Today `handle_message` would hit the `ACK_FLAG_MASK` case and
-  silently drop those bytes.
-- **Stray SYN at a RECEIVED_ACK listener**: currently falls into
-  `handle_message`'s `default` branch, which fires off an ACK for it. Decide
-  whether that is wanted.
-
-## TODO: retransmission caps
-
-Open. Nothing in the repo requires a cap (no constant, no test). The handout's
-CP1 section is the authority.
-
-- If the listener resends SYN-ACKs forever and the initiator has disappeared,
-  the backend never breaks out, so `cmu_close` -> `pthread_join` hangs. Note
-  that `backend.c:235` breaks only on `death && buf_len == 0`.
-- If a cap is added, "give up" has no obvious reporting path: `cmu_socket`
-  already returned `EXIT_SUCCESS` (`cmu_tcp.c:107-108`), and `cmu_read` /
-  `cmu_write` have no error path for "never connected."
-
-## Design choice recorded
-
-The handshake can only complete via the SYN-ACK/ACK exchange. `single_send`
-already stamps an ack number on every data packet (`backend.c:191`), so a data
-packet's ack field *could* substitute for a lost third-leg ACK, but the plan
-deliberately does not use it: the listener ignores unestablished traffic. Cost
-is one `DEFAULT_TIMEOUT` of dead air when the third ACK drops; benefit is
-simpler dispatch logic.
-
----
-
 ## Sliding window (Go-Back-N)
+
+**Status: implemented** in `backend.c` (`single_send`, `resend_window`,
+`handle_message`, `begin_backend`). 
 
 The window is driven by the **backend loop**, not by a blocking `single_send`.
 `single_send` becomes a non-blocking "fill the window" step: it sends whatever
@@ -279,34 +192,11 @@ the window currently allows and returns. ACKs slide the window in
 also the shape CP2 needs (flow and congestion control only change the window
 size).
 
-### Why not inside `single_send`
-
-Today `single_send` (`backend.c:296-304`) loops until every byte of its batch is
-acked. Keeping the window inside it would:
-
-- **Block the loop body** - the same problem the handshake plan avoids. While it
-  runs, new `cmu_write` data can't join the window (it drains to empty at the
-  end of every batch), and a waiting `cmu_read` isn't signaled
-  (`backend.c:391`) even though `check_for_data` keeps filling `received_buf`.
-- **Need state that outlives the call anyway** - unacked bytes, the next seq to
-  send, and the timer must persist until ACKs arrive. Today the batch is a local
-  copy freed right after the call returns (`backend.c:369-376`).
-- **Split ACK processing** - `handle_message` already advances
-  `last_ack_received`, so the window already slides outside `single_send`.
-- **Use `poll` as the timer** - `check_for_data(sock, TIMEOUT, DEFAULT_TIMEOUT)`
-  (`backend.c:300`) returns on *any* packet, and the current loop resends
-  whenever that packet doesn't ack `seq`. With a window, ACKs arrive constantly.
-  Same rule as the handshake timers: elapsed time is the only thing that decides
-  a resend.
-
 ### State
-
-| field | meaning |
-|---|---|
-| `window.last_ack_received` | **base**: oldest unacked seq (existing field) |
-| `window.next_seq_to_send` | seq of the next *new* byte; high-water mark of what was sent |
-| `outbound_buf`, `outbound_len` | bytes from base onward: in flight, then not yet sent |
-| `sent_data_time` | retransmit timer start (monotonic), for the oldest unacked segment |
+- `outbound_buf` contains the bytes which need to be sent
+- `window.last_ack_received` is the base of the sliding window
+- `window.next_seq_to_send` is the next byte outside of the window
+- `sent_data_time` helps us track timeout for sending data
 
 Window size for CP1 is `CP1_WINDOW_SIZE` (`grading.h`, `MSS * 32`).
 
@@ -320,6 +210,22 @@ Invariants (all `uint32_t` arithmetic, so wraparound is safe):
 - The timer is **running iff `in_flight > 0`**. No separate flag:
   `sent_data_time` is only consulted when something is in flight.
 
+### Timer rules
+
+`sent_data_time` is written in exactly three places:
+
+1. `single_send` sends into an empty pipe (`in_flight == 0`): start.
+2. An ACK moves base forward and data is still in flight: restart, so the timer
+   now covers the new oldest segment.
+3. `resend_window` runs: restart.
+
+Nothing else touches it. In particular, a duplicate ACK or an unrelated packet
+does **not** restart it. If waiting were `check_for_data(sock, TIMEOUT,
+DEFAULT_TIMEOUT)`, every arrival would restart the 3s; after a loss the
+receiver sends a duplicate ACK for each later segment, so each one would push
+recovery back. The loop checks `ms_since(&sent_data_time) > DEFAULT_TIMEOUT` on
+every pass, the same pattern as the SYN and SYN-ACK timers.
+
 ### Backend loop
 
 Per iteration, after the handshake timers:
@@ -331,7 +237,7 @@ if (established && sending_len > 0) {
     free sending_buf; sending_len = 0
 }
 pending = sending_len
-unlock(send_lock)
+unlock(send_lock)                          // before the break, unlike today
 
 if (dying && pending == 0 && outbound_len == 0) break   // see Exit below
 
@@ -345,6 +251,12 @@ if (established) {
 check_for_data(sock, TIMEOUT, LOOP_TICK_MS)   // ACKs slide the window here
 signal wait_cond if received_len > 0
 ```
+
+- Each pass handles at most one incoming packet. That is enough: when packets
+  are queued, `poll` returns immediately, so a burst of ACKs drains at full
+  loop speed. The `LOOP_TICK_MS` wait only applies when nothing is arriving.
+- An ACK processed at the end of one pass is acted on at the top of the next,
+  so freed window space is refilled within one pass.
 
 ### Sending
 
@@ -364,6 +276,8 @@ single_send(sock) {
   from `last_ack_received` (`backend.c:282`), which is only correct with one
   packet in flight.
 - No `check_for_data` inside `single_send` any more.
+- Data packets set the **ACK flag**, with `ack = next_seq_expected`, as the
+  course tests expect (every packet after the SYN carries an ACK).
 
 ### Retransmission
 
@@ -378,65 +292,62 @@ resend_window(sock) {
 ```
 
 - Go-Back-N: on timeout, everything in flight is resent, starting from base.
+  That is only what is still unacked, not the original batch: if part of the
+  window was acked before the timer fired, those bytes are already trimmed.
 - `next_seq_to_send` is unchanged, so it stays the high-water mark that ACK
   validation checks against.
 
 ### ACK processing (`handle_message`, `ACK_FLAG_MASK` case)
 
+Every packet after the SYN carries the ACK flag, so this case sees both pure
+ACKs and data packets.
+
 ```
 ack = get_ack(hdr)
 if (state == RECEIVED_SYN) {
-    if (check_valid_ack(sock, hdr)) {
-        state = HANDSHAKE_ESTABLISHED
-        last_ack_received = ack       // acks the SYN's seq; nothing to trim
-        next_seq_to_send = ack
-    }
+    if (!check_valid_ack(sock, hdr)) break
+    state = HANDSHAKE_ESTABLISHED
+    last_ack_received = ack           // acks the SYN's seq; nothing to trim
+    next_seq_to_send = ack
+} else if (state == HANDSHAKE_ESTABLISHED) {
+    handle_ack(sock, ack)             // slide the window
+} else {
     break
 }
-if (after(ack, last_ack_received) && !after(ack, next_seq_to_send)) {
-    drop the first (ack - last_ack_received) bytes of outbound_buf
-    last_ack_received = ack
-    if (in_flight > 0) sent_data_time = now()   // restart for new oldest segment
+if (payload_len > 0) handle_data(sock, pkt)
+
+handle_ack(sock, ack) {
+    if (after(ack, last_ack_received) && !after(ack, next_seq_to_send)) {
+        drop the first (ack - last_ack_received) bytes of outbound_buf
+        last_ack_received = ack
+        if (in_flight > 0) sent_data_time = now()   // restart for new oldest segment
+    }
+    // ack <= base: old or duplicate, ignore (CP2 counts these).
+    // ack > next_seq_to_send: acks bytes never sent, ignore.
 }
-// ack <= base: old or duplicate, ignore (CP2 counts these).
-// ack > next_seq_to_send: acks bytes never sent, ignore.
+
+handle_data(sock, pkt) {
+    if (seq == next_seq_expected) {   // in order: keep it
+        append payload to received_buf
+        next_seq_expected += payload_len
+    }                                 // otherwise discard
+    send ACK with ack = next_seq_expected   // cumulative, either way
+}
 ```
 
-### Receiver side
-
-- The `default` (data) case acks `get_seq(hdr) + get_payload_len(pkt)`
-  (`backend.c:172`) - the end of *whatever packet arrived*, sent before the
-  in-order check (`backend.c:187`). Harmless under stop-and-wait. With a window,
-  if packet 1 is lost and packet 2 arrives, that ACK covers packet 1's bytes,
-  and the sender trims data the receiver never got.
-- Go-Back-N receiver: accept only `seq == next_seq_expected`, discard anything
-  else, and always ACK **`next_seq_expected`** (cumulative), *after* updating it.
-
-### Handshake hand-off
-
-- On every transition to `HANDSHAKE_ESTABLISHED`, set
-  `next_seq_to_send = last_ack_received` (= ISN + 1). So `in_flight == 0` and
-  the first data byte continues the sequence space right after the SYN.
-  - Initiator: in the SYN-ACK case, after `last_ack_received = get_ack(hdr)`.
-  - Listener: in the ACK case, as above.
-- The handshake ACK moves base past the SYN's seq but must **not** go through
-  the trim path: the SYN's byte was never in `outbound_buf`.
-
-### Concurrency
-
-- `outbound_buf`, `next_seq_to_send`, and `sent_data_time` are touched only by
-  the loop, `single_send`, and `handle_message`, all on the backend thread, so
-  they need **no lock** (same argument as the handshake fields).
-- `sending_buf` is still shared with `cmu_write`; only the hand-off into
-  `outbound_buf` takes `send_lock`, as today.
-
-### Exit
-
-- `backend.c:364` breaks on `death && buf_len == 0`. With a window,
-  `sending_buf` can be empty while bytes are still unacked in `outbound_buf`;
-  breaking then drops in-flight data. Exit requires **both** to be empty.
-- Consequence: if the peer has gone, the sender retransmits forever and
-  `cmu_close` hangs. Same open question as retransmission caps above.
+- The ACK field of a data packet is processed like any other ACK, so ACKs
+  piggybacked on data slide the window too.
+- **Pure ACKs are never answered**; only packets with a payload get an ACK
+  back. That keeps two peers from ACKing each other's ACKs forever, and the
+  course test expects no reply to the third-leg ACK.
+- If the third-leg ACK is lost, the initiator's first data packet carries the
+  same `ack` value, so it completes the handshake at the listener and its
+  payload is accepted. No timeout is spent waiting for a retransmit.
+- Packets with a payload and **no** flags are still accepted as data once
+  established, through the `default` case.
+- The gate on `HANDSHAKE_ESTABLISHED` matters: before establishment
+  `next_seq_to_send` hasn't been set, so the window's range check means
+  nothing, and a stray ACK could move base.
 
 ## TODO: window open items
 

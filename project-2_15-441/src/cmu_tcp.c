@@ -53,6 +53,9 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   // other side of the connection.
   sock->window.last_ack_received = 0;
   sock->window.next_seq_expected = 0;
+  sock->window.next_seq_to_send = 0;
+  sock->outbound_buf = NULL;
+  sock->outbound_len = 0;
 
   // The initiator picks its ISN in the backend's INIT state.
   sock->handshake_state = INIT;
@@ -127,6 +130,9 @@ int cmu_close(cmu_socket_t *sock) {
     }
     if (sock->sending_buf != NULL) {
       free(sock->sending_buf);
+    }
+    if (sock->outbound_buf != NULL) {
+      free(sock->outbound_buf);
     }
   } else {
     perror("ERROR null socket\n");

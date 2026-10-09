@@ -12,7 +12,7 @@ from pathlib import Path
 from scapy.all import rdpcap
 from fabric import Connection
 
-from common import PCAP, CMUTCP, ACK_MASK, IP_ADDRS
+from common import PCAP, CMUTCP, ACK_MASK, SYN_MASK, IP_ADDRS
 
 
 def test_pcap_packets_max_size():
@@ -49,15 +49,26 @@ def test_pcap_acks():
         print("Test Failed")
         return
 
+    # The third handshake ACK acknowledges a SYN-ACK (its seq + 1), not data.
+    handshake_acks = set()
+    for pkt in packets:
+        if CMUTCP in pkt and pkt[CMUTCP].flags == SYN_MASK | ACK_MASK:
+            handshake_acks.add(pkt[CMUTCP].seq_num + 1)
+
     expected_acks = []
     ack_nums = []
     for pkt in packets:
         if CMUTCP in pkt:
             # Ignore handshake packets, should test in a different test.
-            if pkt[CMUTCP].flags == 0:
-                payload_len = pkt[CMUTCP].plen - pkt[CMUTCP].hlen
+            # Data is identified by its payload, not its flags: data packets
+            # carry the ACK flag. SYN and SYN-ACK have no payload.
+            payload_len = pkt[CMUTCP].plen - pkt[CMUTCP].hlen
+            if payload_len > 0:
                 expected_acks.append(pkt[CMUTCP].seq_num + payload_len)
-            elif pkt[CMUTCP].flags == ACK_MASK:
+            elif (
+                pkt[CMUTCP].flags == ACK_MASK
+                and pkt[CMUTCP].ack_num not in handshake_acks
+            ):
                 ack_nums.append(pkt[CMUTCP].ack_num)
 
     # Probably not the best way to do this test!
