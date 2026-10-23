@@ -30,6 +30,7 @@
 #include "cmu_tcp.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
 
 // Backend loop heartbeat: how long each iteration waits for a packet (ms).
 #define LOOP_TICK_MS 20
@@ -64,6 +65,16 @@ static uint32_t random_isn(void) {
 }
 
 /**
+ * Free space in the receive buffer, which is what we advertise. Out-of-order
+ * segments aren't subtracted: `handle_data` only accepts bytes below the
+ * window's right edge, which keeps them within this space too. Caller holds
+ * recv_lock, since cmu_read shrinks `received_len`.
+ */
+static uint16_t advertised_window(cmu_socket_t *sock) {
+  return MAX_NETWORK_BUFFER - sock->received_len;
+}
+
+/**
  * Sends a header-only packet (no payload) to the socket's peer.
  *
  * @param sock The socket to send on.
@@ -78,7 +89,7 @@ static void send_empty_packet(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
   uint16_t dst = ntohs(sock->conn.sin_port);
   uint16_t hlen = sizeof(cmu_tcp_header_t);
   uint16_t plen = hlen;
-  uint16_t adv_window = 1;
+  uint16_t adv_window = advertised_window(sock);
   uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, plen, flags,
                                adv_window, 0, NULL, NULL, 0);
 
@@ -104,7 +115,7 @@ static void send_data_segment(cmu_socket_t *sock, uint32_t seq,
   uint16_t hlen = sizeof(cmu_tcp_header_t);
   uint16_t plen = hlen + payload_len;
   uint8_t flags = ACK_FLAG_MASK;  // Every packet after the SYN carries an ACK.
-  uint16_t adv_window = 1;
+  uint16_t adv_window = advertised_window(sock);
   uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, plen, flags,
                                adv_window, 0, NULL, payload, payload_len);
 
@@ -149,14 +160,97 @@ int has_been_acked(cmu_socket_t *sock, uint32_t seq) {
 }
 
 /**
- * Slides the send window for an acknowledgement received after the handshake.
- * Old or duplicate ACKs (ack <= base) and ACKs for bytes never sent
- * (ack > next_seq_to_send) are ignored.
+ * Resends the oldest unacknowledged bytes, at most `max_len` of them, and
+ * restarts the retransmit timer. Leaves `next_seq_to_send` alone.
+ *
+ * @param sock The socket to use for sending data.
+ * @param max_len Most bytes to resend: MSS for a lost segment, 1 for a probe.
+ */
+static void retransmit_oldest(cmu_socket_t *sock, uint32_t max_len) {
+  uint16_t payload_len = MIN(max_len, bytes_in_flight(sock));
+  send_data_segment(sock, sock->window.last_ack_received, sock->outbound_buf,
+                    payload_len);
+  clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
+}
+
+/**
+ * Three duplicate ACKs: halve the window, inflate it by the three segments
+ * that left the network, and fast-retransmit the missing segment.
+ */
+static void enter_fast_recovery(cmu_socket_t *sock) {
+  sock->ssthresh = MAX(sock->cwnd / 2, 2 * MSS);
+  sock->cwnd = sock->ssthresh + 3 * MSS;
+  sock->cc_state = FAST_RECOVERY;
+  retransmit_oldest(sock, MSS);
+}
+
+/**
+ * Retransmit timeout: halve ssthresh, collapse the window to one segment, and
+ * resend only the missing segment. The receiver buffers what came after it.
+ */
+static void enter_slow_start(cmu_socket_t *sock) {
+  sock->ssthresh = MAX(sock->cwnd / 2, 2 * MSS);
+  sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+  sock->dup_ack_count = 0;
+  sock->cc_state = SLOW_START;
+  retransmit_oldest(sock, MSS);
+}
+
+/**
+ * Grows or deflates the congestion window for an ACK that advanced the base.
+ */
+static void on_new_ack(cmu_socket_t *sock) {
+  switch (sock->cc_state) {
+    case SLOW_START:
+      sock->cwnd += MSS;
+      if (sock->cwnd >= sock->ssthresh) {
+        sock->cc_state = CONGESTION_AVOIDANCE;
+      }
+      break;
+    case CONGESTION_AVOIDANCE:
+      // About one MSS per window's worth of ACKs.
+      sock->cwnd += MAX(1, MSS * MSS / sock->cwnd);
+      break;
+    case FAST_RECOVERY:
+      sock->cwnd = sock->ssthresh;
+      sock->cc_state = CONGESTION_AVOIDANCE;
+      break;
+  }
+  sock->dup_ack_count = 0;
+}
+
+/**
+ * Counts a duplicate ACK; the third one triggers fast retransmit. In fast
+ * recovery each one means another segment left the network.
+ */
+static void on_dup_ack(cmu_socket_t *sock) {
+  if (sock->cc_state == FAST_RECOVERY) {
+    sock->cwnd += MSS;
+    return;
+  }
+  sock->dup_ack_count++;
+  if (sock->dup_ack_count == 3) {
+    enter_fast_recovery(sock);
+  }
+}
+
+/**
+ * Handles an acknowledgement received after the handshake. A new ACK slides
+ * the send window; a duplicate one feeds congestion control. ACKs for bytes
+ * never sent (ack > next_seq_to_send) and older ACKs are ignored.
  *
  * @param sock The socket whose window to slide.
  * @param ack The acknowledgement number received.
+ * @param is_pure_ack Whether the packet carried no payload.
  */
-static void handle_ack(cmu_socket_t *sock, uint32_t ack) {
+static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack) {
+  if (ack == sock->window.last_ack_received) {
+    // With a zero window, repeated ACKs answer our probes; they aren't loss.
+    if (is_pure_ack && bytes_in_flight(sock) > 0 && sock->rwnd > 0) {
+      on_dup_ack(sock);
+    }
+    return;
+  }
   if (!after(ack, sock->window.last_ack_received) ||
       after(ack, sock->window.next_seq_to_send)) {
     return;
@@ -169,11 +263,66 @@ static void handle_ack(cmu_socket_t *sock, uint32_t ack) {
   if (bytes_in_flight(sock) > 0) {
     clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
   }
+  on_new_ack(sock);
 }
 
 /**
- * Accepts a data packet's payload if it is the next in-order segment, discards
- * it otherwise, and answers either way with a cumulative acknowledgement.
+ * Appends in-order bytes to `received_buf` for cmu_read.
+ */
+static void deliver(cmu_socket_t *sock, uint8_t *data, uint32_t len) {
+  sock->received_buf = realloc(sock->received_buf, sock->received_len + len);
+  memcpy(sock->received_buf + sock->received_len, data, len);
+  sock->received_len += len;
+  sock->window.next_seq_expected += len;
+}
+
+/**
+ * Stores a segment that arrived beyond a gap, keeping the list sorted by seq.
+ * A segment already buffered at the same seq is a duplicate and is dropped.
+ */
+static void buffer_ooo(cmu_socket_t *sock, uint32_t seq, uint8_t *data,
+                       uint16_t len) {
+  ooo_segment_t **link = &sock->ooo_head;
+  while (*link != NULL && before((*link)->seq, seq)) {
+    link = &(*link)->next;
+  }
+  if (*link != NULL && (*link)->seq == seq) {
+    return;
+  }
+  ooo_segment_t *segment = malloc(sizeof(ooo_segment_t));
+  segment->seq = seq;
+  segment->len = len;
+  segment->data = malloc(len);
+  memcpy(segment->data, data, len);
+  segment->next = *link;
+  *link = segment;
+}
+
+/**
+ * Delivers buffered segments that the last delivery made contiguous, trimming
+ * any bytes already delivered, and frees them.
+ */
+static void drain_ooo(cmu_socket_t *sock) {
+  while (sock->ooo_head != NULL &&
+         !after(sock->ooo_head->seq, sock->window.next_seq_expected)) {
+    ooo_segment_t *segment = sock->ooo_head;
+    uint32_t end = segment->seq + segment->len;
+    if (after(end, sock->window.next_seq_expected)) {
+      uint32_t skip = sock->window.next_seq_expected - segment->seq;
+      deliver(sock, segment->data + skip, segment->len - skip);
+    }
+    sock->ooo_head = segment->next;
+    free(segment->data);
+    free(segment);
+  }
+}
+
+/**
+ * Accepts a data packet's payload if it fits in the advertised window:
+ * in-order bytes go to `received_buf` (along with any buffered segments they
+ * make contiguous), bytes beyond a gap go to the out-of-order buffer. Answers
+ * every data packet, accepted or not, with a cumulative acknowledgement, so a
+ * sender whose ACK was lost learns what already arrived.
  *
  * @param sock The socket receiving the data.
  * @param pkt The data packet.
@@ -182,16 +331,22 @@ static void handle_data(cmu_socket_t *sock, uint8_t *pkt) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint32_t seq = get_seq(hdr);
   uint16_t payload_len = get_payload_len(pkt);
+  uint8_t *payload = get_payload(pkt);
+  uint32_t expected = sock->window.next_seq_expected;
+  uint32_t end = seq + payload_len;
+  uint32_t right_edge = expected + advertised_window(sock);
 
-  if (seq == sock->window.next_seq_expected) {
-    sock->window.next_seq_expected = seq + payload_len;
-    uint8_t *payload = get_payload(pkt);
-
-    // Make sure there is enough space in the buffer to store the payload.
-    sock->received_buf =
-        realloc(sock->received_buf, sock->received_len + payload_len);
-    memcpy(sock->received_buf + sock->received_len, payload, payload_len);
-    sock->received_len += payload_len;
+  // Skip segments already delivered (end <= expected) or not fully inside the
+  // window. A zero-window probe lands here and only earns an ACK.
+  if (after(end, expected) && !after(end, right_edge)) {
+    if (!after(seq, expected)) {
+      // Resegmented retransmissions can overlap delivered bytes; skip them.
+      uint32_t skip = expected - seq;
+      deliver(sock, payload + skip, payload_len - skip);
+      drain_ooo(sock);
+    } else {
+      buffer_ooo(sock, seq, payload, payload_len);
+    }
   }
 
   // Cumulative ACK: everything before next_seq_expected, whatever arrived.
@@ -211,6 +366,9 @@ static void handle_data(cmu_socket_t *sock, uint8_t *pkt) {
 void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
   uint8_t flags = get_flags(hdr);
+
+  // Every packet carries the peer's free receive space.
+  sock->rwnd = get_advertised_window(hdr);
 
   switch (flags) {
     case SYN_FLAG_MASK: {
@@ -257,7 +415,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
         sock->window.next_seq_to_send = ack;
         sock->handshake_state = HANDSHAKE_ESTABLISHED;
       } else if (sock->handshake_state == HANDSHAKE_ESTABLISHED) {
-        handle_ack(sock, ack);
+        handle_ack(sock, ack, get_payload_len(pkt) == 0);
       } else {
         // Before the handshake, next_seq_to_send isn't set yet, so the
         // window's range check would be meaningless.
@@ -346,13 +504,20 @@ void check_for_data(cmu_socket_t *sock, cmu_read_mode_t flags,
  * blocks: ACKs slide the window in `handle_message`, and the backend loop calls
  * this again on its next iteration to fill the space they free.
  *
+ * The window is min(cwnd, rwnd). If the peer's window is closed and nothing is
+ * in flight, sends a 1-byte zero-window probe instead; the retransmit timer
+ * then re-probes every DEFAULT_TIMEOUT until an ACK reopens the window.
+ *
  * @param sock The socket to use for sending data.
  */
 void single_send(cmu_socket_t *sock) {
-  uint32_t window = CP1_WINDOW_SIZE;
+  uint32_t window = MIN(sock->cwnd, sock->rwnd);
   uint32_t outbound_len = sock->outbound_len;
   uint32_t in_flight = bytes_in_flight(sock);
 
+  if (window == 0 && in_flight == 0) {
+    window = 1;
+  }
   while (in_flight < window && in_flight < outbound_len) {
     uint16_t payload_len =
         MIN(MIN((uint32_t)MSS, outbound_len - in_flight), window - in_flight);
@@ -365,25 +530,6 @@ void single_send(cmu_socket_t *sock) {
     sock->window.next_seq_to_send += payload_len;
     in_flight += payload_len;
   }
-}
-
-/**
- * Go-Back-N retransmission: resends every unacknowledged byte, oldest first,
- * and restarts the retransmit timer. Leaves `next_seq_to_send` alone.
- *
- * @param sock The socket to use for sending data.
- */
-static void resend_window(cmu_socket_t *sock) {
-  uint32_t in_flight = bytes_in_flight(sock);
-  uint32_t offset = 0;
-
-  while (offset < in_flight) {
-    uint16_t payload_len = MIN((uint32_t)MSS, in_flight - offset);
-    send_data_segment(sock, sock->window.last_ack_received + offset,
-                      sock->outbound_buf + offset, payload_len);
-    offset += payload_len;
-  }
-  clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
 }
 
 void *begin_backend(void *in) {
@@ -455,11 +601,20 @@ void *begin_backend(void *in) {
     }
 
     if (can_send) {
+      // Outgoing packets advertise our window, which reads received_len.
+      while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+      }
       if (bytes_in_flight(sock) > 0 &&
           ms_since(&sock->sent_data_time) > DEFAULT_TIMEOUT) {
-        resend_window(sock);
+        if (sock->rwnd == 0) {
+          // Peer's window is closed, not congested: just probe again.
+          retransmit_oldest(sock, 1);
+        } else {
+          enter_slow_start(sock);
+        }
       }
       single_send(sock);
+      pthread_mutex_unlock(&(sock->recv_lock));
     }
 
     check_for_data(sock, TIMEOUT, LOOP_TICK_MS);

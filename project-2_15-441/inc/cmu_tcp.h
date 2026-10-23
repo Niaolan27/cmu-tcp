@@ -54,6 +54,26 @@ typedef enum {
 } handshake_state_t;
 
 /**
+ * TCP Reno congestion control states.
+ */
+typedef enum {
+  SLOW_START = 0,
+  CONGESTION_AVOIDANCE,
+  FAST_RECOVERY,
+} cc_state_t;
+
+/**
+ * A segment that arrived ahead of `next_seq_expected`. Kept in a list sorted
+ * by seq until the gap before it is filled.
+ */
+typedef struct ooo_segment {
+  uint32_t seq;
+  uint16_t len;
+  uint8_t* data;
+  struct ooo_segment* next;
+} ooo_segment_t;
+
+/**
  * This structure holds the state of a socket. You may modify this structure as
  * you see fit to include any additional state you need for your implementation.
  */
@@ -82,6 +102,14 @@ typedef struct {
   uint8_t* outbound_buf;
   int outbound_len;
   struct timespec sent_data_time;  // Retransmit timer for the oldest segment.
+  // Congestion and flow control. Backend thread only, so no lock.
+  cc_state_t cc_state;
+  uint32_t cwnd;           // Congestion window, in bytes.
+  uint32_t ssthresh;       // Slow start threshold, in bytes.
+  uint32_t dup_ack_count;  // Duplicate ACKs since the last new ACK.
+  uint32_t rwnd;           // Peer's last advertised window, in bytes.
+  // Segments received beyond a gap, guarded by recv_lock like received_buf.
+  ooo_segment_t* ooo_head;
 } cmu_socket_t;
 
 /*

@@ -57,6 +57,14 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->outbound_buf = NULL;
   sock->outbound_len = 0;
 
+  sock->cc_state = SLOW_START;
+  sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
+  sock->ssthresh = WINDOW_INITIAL_SSTHRESH;
+  sock->dup_ack_count = 0;
+  // Overwritten by the peer's first packet.
+  sock->rwnd = MAX_NETWORK_BUFFER;
+  sock->ooo_head = NULL;
+
   // The initiator picks its ISN in the backend's INIT state.
   sock->handshake_state = INIT;
   sock->isn = 0;
@@ -133,6 +141,12 @@ int cmu_close(cmu_socket_t *sock) {
     }
     if (sock->outbound_buf != NULL) {
       free(sock->outbound_buf);
+    }
+    while (sock->ooo_head != NULL) {
+      ooo_segment_t *next = sock->ooo_head->next;
+      free(sock->ooo_head->data);
+      free(sock->ooo_head);
+      sock->ooo_head = next;
     }
   } else {
     perror("ERROR null socket\n");
