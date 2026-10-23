@@ -532,9 +532,62 @@ void single_send(cmu_socket_t *sock) {
   }
 }
 
+/**
+ * Opens the congestion-control trace if CWND_LOG names a file. Rows are
+ * line-buffered so the trace survives the process being killed mid-transfer.
+ */
+static void cc_log_open(cmu_socket_t *sock) {
+  const char *path = getenv("CWND_LOG");
+  cc_log_t *trace = &sock->cc_log;
+
+  trace->file = NULL;
+  if (path == NULL) {
+    return;
+  }
+  trace->file = fopen(path, "w");
+  if (trace->file == NULL) {
+    perror("ERROR opening CWND_LOG");
+    return;
+  }
+  setvbuf(trace->file, NULL, _IOLBF, 0);
+  fprintf(trace->file, "time_s,cwnd,ssthresh,state,rwnd\n");
+  clock_gettime(CLOCK_MONOTONIC, &trace->start);
+  trace->cwnd = 0;  // Never a real cwnd, so the first row always gets written.
+}
+
+/**
+ * Appends a row to the congestion-control trace if cwnd, ssthresh, or the
+ * congestion state changed since the last row. Time is seconds since the
+ * backend started; rwnd is the peer's last advertised window.
+ */
+static void cc_log_write(cmu_socket_t *sock) {
+  static const char *state_names[] = {"SLOW_START", "CONGESTION_AVOIDANCE",
+                                      "FAST_RECOVERY"};
+  cc_log_t *trace = &sock->cc_log;
+  struct timespec now;
+
+  if (trace->file == NULL || sock->handshake_state != HANDSHAKE_ESTABLISHED) {
+    return;
+  }
+  if (trace->cwnd == sock->cwnd && trace->ssthresh == sock->ssthresh &&
+      trace->cc_state == sock->cc_state) {
+    return;
+  }
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  fprintf(trace->file, "%.6f,%u,%u,%s,%u\n",
+          (now.tv_sec - trace->start.tv_sec) +
+              (now.tv_nsec - trace->start.tv_nsec) / 1e9,
+          sock->cwnd, sock->ssthresh, state_names[sock->cc_state], sock->rwnd);
+  trace->cwnd = sock->cwnd;
+  trace->ssthresh = sock->ssthresh;
+  trace->cc_state = sock->cc_state;
+}
+
 void *begin_backend(void *in) {
   cmu_socket_t *sock = (cmu_socket_t *)in;
   int death, buf_len, send_signal;
+
+  cc_log_open(sock);
 
   while (1) {
     if (sock->type == TCP_INITIATOR) {
@@ -616,8 +669,11 @@ void *begin_backend(void *in) {
       single_send(sock);
       pthread_mutex_unlock(&(sock->recv_lock));
     }
+    // Logged before reading a packet so a timeout's cut gets its own row.
+    cc_log_write(sock);
 
     check_for_data(sock, TIMEOUT, LOOP_TICK_MS);
+    cc_log_write(sock);
 
     while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
     }
@@ -631,6 +687,9 @@ void *begin_backend(void *in) {
     }
   }
 
+  if (sock->cc_log.file != NULL) {
+    fclose(sock->cc_log.file);
+  }
   pthread_exit(NULL);
   return NULL;
 }

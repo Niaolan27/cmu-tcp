@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
@@ -74,6 +75,20 @@ typedef struct ooo_segment {
 } ooo_segment_t;
 
 /**
+ * Congestion-control trace for plotting. If the CWND_LOG environment variable
+ * names a file, the backend writes a CSV row there whenever cwnd, ssthresh,
+ * or the congestion state changes. Backend thread only, so no lock.
+ */
+typedef struct {
+  FILE* file;  // NULL when logging is off.
+  struct timespec start;
+  // Values in the last row written, so unchanged ones aren't repeated.
+  uint32_t cwnd;
+  uint32_t ssthresh;
+  cc_state_t cc_state;
+} cc_log_t;
+
+/**
  * This structure holds the state of a socket. You may modify this structure as
  * you see fit to include any additional state you need for your implementation.
  */
@@ -110,6 +125,7 @@ typedef struct {
   uint32_t rwnd;           // Peer's last advertised window, in bytes.
   // Segments received beyond a gap, guarded by recv_lock like received_buf.
   ooo_segment_t* ooo_head;
+  cc_log_t cc_log;
 } cmu_socket_t;
 
 /*
