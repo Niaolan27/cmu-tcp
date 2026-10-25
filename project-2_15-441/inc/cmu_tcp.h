@@ -123,6 +123,7 @@ typedef struct {
   uint32_t ssthresh;       // Slow start threshold, in bytes.
   uint32_t dup_ack_count;  // Duplicate ACKs since the last new ACK.
   uint32_t rwnd;           // Peer's last advertised window, in bytes.
+  int sent_zero_window;    // Our last packet advertised a zero window.
   // Segments received beyond a gap, guarded by recv_lock like received_buf.
   ooo_segment_t* ooo_head;
   cc_log_t cc_log;

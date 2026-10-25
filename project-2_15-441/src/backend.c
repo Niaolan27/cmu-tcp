@@ -95,6 +95,7 @@ static void send_empty_packet(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
 
   sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
          conn_len);
+  sock->sent_zero_window = adv_window == 0;
   free(pkt);
 }
 
@@ -121,6 +122,7 @@ static void send_data_segment(cmu_socket_t *sock, uint32_t seq,
 
   sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
          conn_len);
+  sock->sent_zero_window = adv_window == 0;
   free(pkt);
 }
 
@@ -667,6 +669,12 @@ void *begin_backend(void *in) {
         }
       }
       single_send(sock);
+      // We last advertised a zero window and cmu_read has since freed space.
+      // The peer won't send until it hears, so send the new window.
+      if (sock->sent_zero_window && advertised_window(sock) > 0) {
+        send_empty_packet(sock, sock->window.last_ack_received,
+                          sock->window.next_seq_expected, ACK_FLAG_MASK);
+      }
       pthread_mutex_unlock(&(sock->recv_lock));
     }
     // Logged before reading a packet so a timeout's cut gets its own row.
