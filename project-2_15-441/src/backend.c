@@ -200,8 +200,11 @@ static void enter_slow_start(cmu_socket_t *sock) {
 
 /**
  * Grows or deflates the congestion window for an ACK that advanced the base.
+ *
+ * @param sock The socket whose congestion window to update.
+ * @param acked Bytes the ACK newly acknowledged.
  */
-static void on_new_ack(cmu_socket_t *sock) {
+static void on_new_ack(cmu_socket_t *sock, uint32_t acked) {
   switch (sock->cc_state) {
     case SLOW_START:
       sock->cwnd += MSS;
@@ -210,8 +213,10 @@ static void on_new_ack(cmu_socket_t *sock) {
       }
       break;
     case CONGESTION_AVOIDANCE:
-      // About one MSS per window's worth of ACKs.
-      sock->cwnd += MAX(1, MSS * MSS / sock->cwnd);
+      // MSS*MSS/cwnd per MSS acknowledged, so a window's worth of data adds
+      // about one MSS however it was segmented. The floor keeps ACKs for tiny
+      // segments from rounding down to nothing.
+      sock->cwnd += MAX(1, (MSS * MSS / sock->cwnd) * acked / MSS);
       break;
     case FAST_RECOVERY:
       sock->cwnd = sock->ssthresh;
@@ -265,7 +270,7 @@ static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack) {
   if (bytes_in_flight(sock) > 0) {
     clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
   }
-  on_new_ack(sock);
+  on_new_ack(sock, acked);
 }
 
 /**
