@@ -244,14 +244,23 @@ static void on_dup_ack(cmu_socket_t *sock) {
 /**
  * Handles an acknowledgement received after the handshake. A new ACK slides
  * the send window; a duplicate one feeds congestion control. ACKs for bytes
- * never sent (ack > next_seq_to_send) and older ACKs are ignored.
+ * never sent (ack > next_seq_to_send) and older ACKs are ignored. An ACK that
+ * reopens a zero window restarts sending from its ack number.
  *
  * @param sock The socket whose window to slide.
  * @param ack The acknowledgement number received.
  * @param is_pure_ack Whether the packet carried no payload.
+ * @param window_reopened Whether the peer's window went from zero to nonzero.
  */
-static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack) {
+static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack,
+                       int window_reopened) {
   if (ack == sock->window.last_ack_received) {
+    if (window_reopened) {
+      // A window update, not a duplicate ACK. The peer dropped what we sent
+      // while its window was closed, so resend from here.
+      sock->window.next_seq_to_send = ack;
+      return;
+    }
     // With a zero window, repeated ACKs answer our probes; they aren't loss.
     if (is_pure_ack && bytes_in_flight(sock) > 0 && sock->rwnd > 0) {
       on_dup_ack(sock);
@@ -271,6 +280,10 @@ static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack) {
     clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
   }
   on_new_ack(sock, acked);
+  if (window_reopened) {
+    // Anything past this ACK went into a closed window and was dropped.
+    sock->window.next_seq_to_send = ack;
+  }
 }
 
 /**
@@ -375,6 +388,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   uint8_t flags = get_flags(hdr);
 
   // Every packet carries the peer's free receive space.
+  uint32_t prev_rwnd = sock->rwnd;
   sock->rwnd = get_advertised_window(hdr);
 
   switch (flags) {
@@ -422,7 +436,8 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
         sock->window.next_seq_to_send = ack;
         sock->handshake_state = HANDSHAKE_ESTABLISHED;
       } else if (sock->handshake_state == HANDSHAKE_ESTABLISHED) {
-        handle_ack(sock, ack, get_payload_len(pkt) == 0);
+        handle_ack(sock, ack, get_payload_len(pkt) == 0,
+                   prev_rwnd == 0 && sock->rwnd > 0);
       } else {
         // Before the handshake, next_seq_to_send isn't set yet, so the
         // window's range check would be meaningless.
