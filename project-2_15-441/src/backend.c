@@ -134,6 +134,7 @@ static void send_empty_packet(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
 
   sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
          conn_len);
+  sock->sent_zero_window = adv_window == 0;
   free(pkt);
 }
 
@@ -160,6 +161,7 @@ static void send_data_segment(cmu_socket_t *sock, uint32_t seq,
 
   sendto(sock->socket, pkt, plen, 0, (struct sockaddr *)&(sock->conn),
          conn_len);
+  sock->sent_zero_window = adv_window == 0;
   free(pkt);
 }
 
@@ -239,8 +241,11 @@ static void enter_slow_start(cmu_socket_t *sock) {
 
 /**
  * Grows or deflates the congestion window for an ACK that advanced the base.
+ *
+ * @param sock The socket whose congestion window to update.
+ * @param acked Bytes the ACK newly acknowledged.
  */
-static void on_new_ack(cmu_socket_t *sock) {
+static void on_new_ack(cmu_socket_t *sock, uint32_t acked) {
   switch (sock->cc_state) {
     case SLOW_START:
       sock->cwnd += MSS;
@@ -249,8 +254,10 @@ static void on_new_ack(cmu_socket_t *sock) {
       }
       break;
     case CONGESTION_AVOIDANCE:
-      // About one MSS per window's worth of ACKs.
-      sock->cwnd += MAX(1, MSS * MSS / sock->cwnd);
+      // MSS*MSS/cwnd per MSS acknowledged, so a window's worth of data adds
+      // about one MSS however it was segmented. The floor keeps ACKs for tiny
+      // segments from rounding down to nothing.
+      sock->cwnd += MAX(1, (MSS * MSS / sock->cwnd) * acked / MSS);
       break;
     case FAST_RECOVERY:
       sock->cwnd = sock->ssthresh;
@@ -280,14 +287,23 @@ static void on_dup_ack(cmu_socket_t *sock) {
 /**
  * Handles an acknowledgement received after the handshake. A new ACK slides
  * the send window; a duplicate one feeds congestion control. ACKs for bytes
- * never sent (ack > next_seq_to_send) and older ACKs are ignored.
+ * never sent (ack > next_seq_to_send) and older ACKs are ignored. An ACK that
+ * reopens a zero window restarts sending from its ack number.
  *
  * @param sock The socket whose window to slide.
  * @param ack The acknowledgement number received.
  * @param is_pure_ack Whether the packet carried no payload.
+ * @param window_reopened Whether the peer's window went from zero to nonzero.
  */
-static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack) {
+static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack,
+                       int window_reopened) {
   if (ack == sock->window.last_ack_received) {
+    if (window_reopened) {
+      // A window update, not a duplicate ACK. The peer dropped what we sent
+      // while its window was closed, so resend from here.
+      sock->window.next_seq_to_send = ack;
+      return;
+    }
     // With a zero window, repeated ACKs answer our probes; they aren't loss.
     if (is_pure_ack && bytes_in_flight(sock) > 0 && sock->rwnd > 0) {
       on_dup_ack(sock);
@@ -306,7 +322,11 @@ static void handle_ack(cmu_socket_t *sock, uint32_t ack, int is_pure_ack) {
   if (bytes_in_flight(sock) > 0) {
     clock_gettime(CLOCK_MONOTONIC, &sock->sent_data_time);
   }
-  on_new_ack(sock);
+  on_new_ack(sock, acked);
+  if (window_reopened) {
+    // Anything past this ACK went into a closed window and was dropped.
+    sock->window.next_seq_to_send = ack;
+  }
 }
 
 /**
@@ -411,6 +431,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   uint8_t flags = get_flags(hdr);
 
   // Every packet carries the peer's free receive space.
+  uint32_t prev_rwnd = sock->rwnd;
   sock->rwnd = get_advertised_window(hdr);
 
   switch (flags) {
@@ -458,7 +479,8 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
         sock->window.next_seq_to_send = ack;
         sock->handshake_state = HANDSHAKE_ESTABLISHED;
       } else if (sock->handshake_state == HANDSHAKE_ESTABLISHED) {
-        handle_ack(sock, ack, get_payload_len(pkt) == 0);
+        handle_ack(sock, ack, get_payload_len(pkt) == 0,
+                   prev_rwnd == 0 && sock->rwnd > 0);
       } else {
         // Before the handshake, next_seq_to_send isn't set yet, so the
         // window's range check would be meaningless.
@@ -575,9 +597,62 @@ void single_send(cmu_socket_t *sock) {
   }
 }
 
+/**
+ * Opens the congestion-control trace if CWND_LOG names a file. Rows are
+ * line-buffered so the trace survives the process being killed mid-transfer.
+ */
+static void cc_log_open(cmu_socket_t *sock) {
+  const char *path = getenv("CWND_LOG");
+  cc_log_t *trace = &sock->cc_log;
+
+  trace->file = NULL;
+  if (path == NULL) {
+    return;
+  }
+  trace->file = fopen(path, "w");
+  if (trace->file == NULL) {
+    perror("ERROR opening CWND_LOG");
+    return;
+  }
+  setvbuf(trace->file, NULL, _IOLBF, 0);
+  fprintf(trace->file, "time_s,cwnd,ssthresh,state,rwnd\n");
+  clock_gettime(CLOCK_MONOTONIC, &trace->start);
+  trace->cwnd = 0;  // Never a real cwnd, so the first row always gets written.
+}
+
+/**
+ * Appends a row to the congestion-control trace if cwnd, ssthresh, or the
+ * congestion state changed since the last row. Time is seconds since the
+ * backend started; rwnd is the peer's last advertised window.
+ */
+static void cc_log_write(cmu_socket_t *sock) {
+  static const char *state_names[] = {"SLOW_START", "CONGESTION_AVOIDANCE",
+                                      "FAST_RECOVERY"};
+  cc_log_t *trace = &sock->cc_log;
+  struct timespec now;
+
+  if (trace->file == NULL || sock->handshake_state != HANDSHAKE_ESTABLISHED) {
+    return;
+  }
+  if (trace->cwnd == sock->cwnd && trace->ssthresh == sock->ssthresh &&
+      trace->cc_state == sock->cc_state) {
+    return;
+  }
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  fprintf(trace->file, "%.6f,%u,%u,%s,%u\n",
+          (now.tv_sec - trace->start.tv_sec) +
+              (now.tv_nsec - trace->start.tv_nsec) / 1e9,
+          sock->cwnd, sock->ssthresh, state_names[sock->cc_state], sock->rwnd);
+  trace->cwnd = sock->cwnd;
+  trace->ssthresh = sock->ssthresh;
+  trace->cc_state = sock->cc_state;
+}
+
 void *begin_backend(void *in) {
   cmu_socket_t *sock = (cmu_socket_t *)in;
   int death, buf_len, send_signal;
+
+  cc_log_open(sock);
 
   while (1) {
     if (sock->type == TCP_INITIATOR) {
@@ -657,10 +732,19 @@ void *begin_backend(void *in) {
         }
       }
       single_send(sock);
+      // We last advertised a zero window and cmu_read has since freed space.
+      // The peer won't send until it hears, so send the new window.
+      if (sock->sent_zero_window && advertised_window(sock) > 0) {
+        send_empty_packet(sock, sock->window.last_ack_received,
+                          sock->window.next_seq_expected, ACK_FLAG_MASK);
+      }
       pthread_mutex_unlock(&(sock->recv_lock));
     }
+    // Logged before reading a packet so a timeout's cut gets its own row.
+    cc_log_write(sock);
 
     check_for_data(sock, TIMEOUT, LOOP_TICK_MS);
+    cc_log_write(sock);
 
     while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
     }
@@ -674,6 +758,9 @@ void *begin_backend(void *in) {
     }
   }
 
+  if (sock->cc_log.file != NULL) {
+    fclose(sock->cc_log.file);
+  }
   pthread_exit(NULL);
   return NULL;
 }

@@ -63,6 +63,7 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->dup_ack_count = 0;
   // Overwritten by the peer's first packet.
   sock->rwnd = MAX_NETWORK_BUFFER;
+  sock->sent_zero_window = 0;
   sock->ooo_head = NULL;
 
   // The initiator picks its ISN in the backend's INIT state.
