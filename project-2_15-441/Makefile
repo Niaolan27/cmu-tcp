@@ -20,6 +20,11 @@ client: $(OBJS) $(SRC_DIR)/client.c
 tests/testing_server: $(OBJS)
 	$(CC) $(FLAGS) tests/testing_server.c -o tests/testing_server $(OBJS)
 
+cwnd: experiments/cwnd_sender experiments/cwnd_receiver
+
+experiments/%: experiments/%.c $(OBJS)
+	$(CC) $(FLAGS) $< -o $@ $(OBJS)
+
 format:
 	pre-commit run --all-files
 
@@ -30,3 +35,4 @@ test:
 clean:
 	rm -f $(BUILD_DIR)/*.o peer client server
 	rm -f tests/testing_server
+	rm -f experiments/cwnd_sender experiments/cwnd_receiver

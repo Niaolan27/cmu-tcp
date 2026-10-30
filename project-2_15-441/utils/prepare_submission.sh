@@ -22,7 +22,7 @@ if [[ $(git status --porcelain | wc -l) -ne 0 ]]; then
     echo -e "${YELLOW}WARNING: There are uncommitted modified files. Only committed changes will be added to the archive.${NC}"
 fi
 
-cd $SCRIPT_DIR/../..
+cd "$SCRIPT_DIR/../.."
 git archive -o handin.tar.gz HEAD
 
 echo "Upload handin.tar.gz to Gradescope."

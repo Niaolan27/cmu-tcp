@@ -35,6 +35,9 @@
 // Backend loop heartbeat: how long each iteration waits for a packet (ms).
 #define LOOP_TICK_MS 20
 
+// If set, names a CSV file that receives one row per congestion-window change.
+#define CWND_LOG_ENV "CMU_TCP_CWND_LOG"
+
 /**
  * Milliseconds elapsed since `then`, measured on the monotonic clock.
  */
@@ -43,6 +46,42 @@ static long ms_since(const struct timespec *then) {
   clock_gettime(CLOCK_MONOTONIC, &now);
   return (now.tv_sec - then->tv_sec) * 1000L +
          (now.tv_nsec - then->tv_nsec) / 1000000L;
+}
+
+static const char *cc_state_name(cc_state_t state) {
+  switch (state) {
+    case SLOW_START:
+      return "slow_start";
+    case CONGESTION_AVOIDANCE:
+      return "congestion_avoidance";
+    case FAST_RECOVERY:
+      return "fast_recovery";
+  }
+  return "unknown";
+}
+
+/**
+ * Appends a row (time_ms, cwnd, ssthresh, state, event) to the CSV named by
+ * CWND_LOG_ENV, for plotting the window over time. A no-op when it's unset.
+ */
+static void log_cwnd(cmu_socket_t *sock, const char *event) {
+  static FILE *log_file = NULL;
+  static int log_checked = 0;
+  static struct timespec log_start;
+  if (!log_checked) {
+    log_checked = 1;
+    const char *path = getenv(CWND_LOG_ENV);
+    if (path != NULL && (log_file = fopen(path, "w")) != NULL) {
+      fprintf(log_file, "time_ms,cwnd,ssthresh,state,event\n");
+      clock_gettime(CLOCK_MONOTONIC, &log_start);
+    }
+  }
+  if (log_file == NULL) {
+    return;
+  }
+  fprintf(log_file, "%ld,%u,%u,%s,%s\n", ms_since(&log_start), sock->cwnd,
+          sock->ssthresh, cc_state_name(sock->cc_state), event);
+  fflush(log_file);
 }
 
 /**
@@ -181,6 +220,7 @@ static void enter_fast_recovery(cmu_socket_t *sock) {
   sock->ssthresh = MAX(sock->cwnd / 2, 2 * MSS);
   sock->cwnd = sock->ssthresh + 3 * MSS;
   sock->cc_state = FAST_RECOVERY;
+  log_cwnd(sock, "3dupack");
   retransmit_oldest(sock, MSS);
 }
 
@@ -193,6 +233,7 @@ static void enter_slow_start(cmu_socket_t *sock) {
   sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
   sock->dup_ack_count = 0;
   sock->cc_state = SLOW_START;
+  log_cwnd(sock, "timeout");
   retransmit_oldest(sock, MSS);
 }
 
@@ -217,6 +258,7 @@ static void on_new_ack(cmu_socket_t *sock) {
       break;
   }
   sock->dup_ack_count = 0;
+  log_cwnd(sock, "ack");
 }
 
 /**
@@ -226,6 +268,7 @@ static void on_new_ack(cmu_socket_t *sock) {
 static void on_dup_ack(cmu_socket_t *sock) {
   if (sock->cc_state == FAST_RECOVERY) {
     sock->cwnd += MSS;
+    log_cwnd(sock, "dupack");
     return;
   }
   sock->dup_ack_count++;
